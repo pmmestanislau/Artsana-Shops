@@ -22,7 +22,7 @@ param(
     [int]$TopFiles = 50,
     [int]$TopFolders = 20,
     [int]$TimeoutSeconds = 600,
-    [string]$ReportPath = ".\Reports",
+    [string]$ReportPath = "",
     [string]$PsExecPath = "",
     [int]$MaxParallel = 10
 )
@@ -44,6 +44,9 @@ $servidores = @(
 )
 
 $ScriptStartTime = Get-Date
+if (-not $ReportPath) {
+    $ReportPath = Join-Path $PSScriptRoot "Reports"
+}
 $TempFolder = "C:\TEMP\AuditDisk"
 $CollectorScript = "AuditCollect.ps1"
 $ResultFile = "audit_result.xml"
