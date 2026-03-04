@@ -287,6 +287,38 @@ function New-HtmlReport {
         $grouped[$shopId] += $r
     }
 
+    # Calcular totais por loja e ordenar por menos espaco livre
+    $shopStats = @()
+    foreach ($shopId in $grouped.Keys) {
+        $shopPCs = $grouped[$shopId]
+        $totalGB = 0; $freeGB = 0; $usedGB = 0
+        foreach ($pc in $shopPCs) {
+            foreach ($disk in $pc.Disks) {
+                $totalGB += $disk.TotalGB
+                $freeGB  += $disk.FreeGB
+                $usedGB  += $disk.UsedGB
+            }
+        }
+        $pctUsed = if ($totalGB -gt 0) { [math]::Round($usedGB / $totalGB * 100, 1) } else { 0 }
+        $shopStats += @{
+            ShopId  = $shopId
+            PCs     = $shopPCs.Count
+            TotalGB = [math]::Round($totalGB, 1)
+            FreeGB  = [math]::Round($freeGB, 1)
+            UsedGB  = [math]::Round($usedGB, 1)
+            PctUsed = $pctUsed
+        }
+    }
+    # Ordenar: menos espaco livre primeiro (mais critico no topo)
+    $shopStats = $shopStats | Sort-Object { $_.FreeGB }
+    $orderedShopIds = $shopStats | ForEach-Object { $_.ShopId }
+
+    # Totais globais
+    $globalTotalGB = [math]::Round(($shopStats | ForEach-Object { $_.TotalGB } | Measure-Object -Sum).Sum, 1)
+    $globalFreeGB  = [math]::Round(($shopStats | ForEach-Object { $_.FreeGB }  | Measure-Object -Sum).Sum, 1)
+    $globalUsedGB  = [math]::Round(($shopStats | ForEach-Object { $_.UsedGB }  | Measure-Object -Sum).Sum, 1)
+    $globalPctUsed = if ($globalTotalGB -gt 0) { [math]::Round($globalUsedGB / $globalTotalGB * 100, 1) } else { 0 }
+
     $css = @"
 <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -320,6 +352,17 @@ function New-HtmlReport {
     .collapsible.collapsed::before { content: '[+] '; }
     .collapsible-content { overflow: hidden; }
     .collapsible-content.hidden { display: none; }
+    .shop-overview { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 20px; }
+    .shop-overview h2 { margin-top: 0; }
+    .bar-container { background: #ecf0f1; border-radius: 4px; height: 18px; position: relative; }
+    .bar-fill { height: 100%; border-radius: 4px; transition: width 0.3s; }
+    .bar-green { background: #27ae60; }
+    .bar-yellow { background: #f39c12; }
+    .bar-red { background: #e74c3c; }
+    .global-stats { display: flex; gap: 15px; margin: 15px 0; flex-wrap: wrap; }
+    .global-stat { background: #2c3e50; color: white; padding: 15px 20px; border-radius: 8px; min-width: 180px; }
+    .global-stat .number { font-size: 22px; font-weight: bold; }
+    .global-stat .label { font-size: 11px; color: #bdc3c7; text-transform: uppercase; }
 </style>
 "@
 
@@ -368,6 +411,38 @@ function toggleSection(id) {
             <div class="label">Lojas</div>
         </div>
     </div>
+
+    <div class="global-stats">
+        <div class="global-stat">
+            <div class="number">$globalTotalGB GB</div>
+            <div class="label">Total Disco (todas as lojas)</div>
+        </div>
+        <div class="global-stat">
+            <div class="number">$globalUsedGB GB</div>
+            <div class="label">Espaco Usado</div>
+        </div>
+        <div class="global-stat" style="background: $(if ($globalPctUsed -ge 85) { '#e74c3c' } elseif ($globalPctUsed -ge 70) { '#f39c12' } else { '#27ae60' })">
+            <div class="number">$globalFreeGB GB</div>
+            <div class="label">Espaco Livre ($globalPctUsed% usado)</div>
+        </div>
+    </div>
+
+    <div class="shop-overview">
+        <h2>Resumo por Loja (ordenado por menos espaco livre)</h2>
+        <table>
+            <tr><th>#</th><th>Loja</th><th>PCs</th><th>Total (GB)</th><th>Usado (GB)</th><th>Livre (GB)</th><th>% Usado</th><th>Estado</th></tr>
+"@
+
+    $rankIdx = 0
+    foreach ($stat in $shopStats) {
+        $rankIdx++
+        $rowClass = if ($stat.PctUsed -ge 85) { "disk-red" } elseif ($stat.PctUsed -ge 70) { "disk-yellow" } else { "disk-green" }
+        $barClass = if ($stat.PctUsed -ge 85) { "bar-red" } elseif ($stat.PctUsed -ge 70) { "bar-yellow" } else { "bar-green" }
+        $html += "            <tr class=`"$rowClass`"><td>$rankIdx</td><td><strong>$($stat.ShopId)</strong></td><td>$($stat.PCs)</td><td>$($stat.TotalGB)</td><td>$($stat.UsedGB)</td><td>$($stat.FreeGB)</td><td>$($stat.PctUsed)%</td><td><div class=`"bar-container`"><div class=`"bar-fill $barClass`" style=`"width:$($stat.PctUsed)%`"></div></div></td></tr>`n"
+    }
+    $html += @"
+        </table>
+    </div>
 "@
 
     if ($OfflineServers.Count -gt 0) {
@@ -385,7 +460,7 @@ function toggleSection(id) {
     }
 
     $sectionId = 0
-    foreach ($shopId in ($grouped.Keys | Sort-Object)) {
+    foreach ($shopId in $orderedShopIds) {
         $shopPCs = $grouped[$shopId]
         $html += @"
 
