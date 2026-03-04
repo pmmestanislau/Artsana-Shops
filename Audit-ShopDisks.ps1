@@ -13,12 +13,15 @@
     Timeout em minutos para cada PC remoto (default: 10)
 .PARAMETER ReportPath
     Pasta onde gravar o relatorio HTML (default: .\Reports)
+.PARAMETER Credential
+    Credenciais explicitas. Se omitido, usa a sessao Windows actual (Kerberos).
 #>
 param(
     [int]$TopFiles = 50,
     [int]$TopFolders = 20,
     [int]$TimeoutMinutes = 10,
-    [string]$ReportPath = ".\Reports"
+    [string]$ReportPath = ".\Reports",
+    [PSCredential]$Credential
 )
 
 # --- Configuracao ---
@@ -63,7 +66,9 @@ function Test-ServerConnectivity {
     foreach ($srv in $Servers) {
         Write-Log "A testar conectividade: $srv ..." "INFO"
         try {
-            $wsmanResult = Test-WSMan -ComputerName $srv -Credential $Credential -ErrorAction Stop
+            $wsmanParams = @{ ComputerName = $srv; ErrorAction = "Stop" }
+            if ($Credential) { $wsmanParams.Credential = $Credential }
+            $wsmanResult = Test-WSMan @wsmanParams
             if ($wsmanResult) {
                 Write-Log "$srv - ONLINE" "OK"
                 $online += $srv
@@ -420,17 +425,16 @@ Write-Log "Parametros: TopFiles=$TopFiles | TopFolders=$TopFolders | Timeout=${T
 # --- FASE 1: Credenciais ---
 Write-Host ""
 Write-Log "FASE 1 - Credenciais" "INFO"
-$credential = Get-Credential -Message "Credenciais para acesso remoto (dominio\utilizador)"
-if (-not $credential) {
-    Write-Log "Credenciais nao fornecidas. A sair." "ERROR"
-    exit 1
+if (-not $Credential) {
+    Write-Log "A usar sessao Windows actual (Kerberos): $env:USERDOMAIN\$env:USERNAME" "OK"
+} else {
+    Write-Log "Credenciais explicitas para: $($Credential.UserName)" "OK"
 }
-Write-Log "Credenciais obtidas para: $($credential.UserName)" "OK"
 
 # --- FASE 2: Teste de Conectividade ---
 Write-Host ""
 Write-Log "FASE 2 - Teste de conectividade a $($servidores.Count) servidores..." "INFO"
-$connectivity = Test-ServerConnectivity -Servers $servidores -Credential $credential
+$connectivity = Test-ServerConnectivity -Servers $servidores -Credential $Credential
 $onlineServers = $connectivity.Online
 $offlineServers = $connectivity.Offline
 
@@ -445,10 +449,15 @@ if ($onlineServers.Count -eq 0) {
 Write-Host ""
 Write-Log "FASE 3 - A lancar recolha de dados em $($onlineServers.Count) PCs (paralelo)..." "INFO"
 
-$jobs = Invoke-Command -ComputerName $onlineServers -Credential $credential `
-    -ScriptBlock $RemoteScriptBlock `
-    -ArgumentList $TopFiles, $TopFolders `
-    -AsJob -JobName "ShopDiskAudit"
+$invokeParams = @{
+    ComputerName = $onlineServers
+    ScriptBlock  = $RemoteScriptBlock
+    ArgumentList = @($TopFiles, $TopFolders)
+    AsJob        = $true
+    JobName      = "ShopDiskAudit"
+}
+if ($Credential) { $invokeParams.Credential = $Credential }
+$jobs = Invoke-Command @invokeParams
 
 Write-Log "Jobs lancados. A aguardar resultados (timeout: ${TimeoutMinutes} minutos)..." "INFO"
 
