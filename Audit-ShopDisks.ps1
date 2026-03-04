@@ -3,25 +3,28 @@
 .SYNOPSIS
     Audita o espaco em disco dos computadores das lojas Artsana Portugal.
 .DESCRIPTION
-    Liga-se remotamente via WinRM a todos os PCs das lojas, recolhe informacao
-    sobre discos, top ficheiros e top pastas, e gera relatorio HTML.
+    Usa PsExec para executar remotamente um script de recolha em cada PC.
+    Recolhe info de discos, top ficheiros e top pastas, e gera relatorio HTML.
 .PARAMETER TopFiles
     Numero de ficheiros maiores a listar por PC (default: 50)
 .PARAMETER TopFolders
     Numero de pastas maiores a listar por PC (default: 20)
-.PARAMETER TimeoutMinutes
-    Timeout em minutos para cada PC remoto (default: 10)
+.PARAMETER TimeoutSeconds
+    Timeout em segundos para cada PC remoto (default: 600)
 .PARAMETER ReportPath
     Pasta onde gravar o relatorio HTML (default: .\Reports)
-.PARAMETER Credential
-    Credenciais explicitas. Se omitido, usa a sessao Windows actual (Kerberos).
+.PARAMETER PsExecPath
+    Caminho para PsExec.exe. Se omitido, descarrega automaticamente.
+.PARAMETER MaxParallel
+    Numero maximo de PCs a auditar em paralelo (default: 10)
 #>
 param(
     [int]$TopFiles = 50,
     [int]$TopFolders = 20,
-    [int]$TimeoutMinutes = 10,
+    [int]$TimeoutSeconds = 600,
     [string]$ReportPath = ".\Reports",
-    [PSCredential]$Credential
+    [string]$PsExecPath = "",
+    [int]$MaxParallel = 10
 )
 
 # --- Configuracao ---
@@ -41,6 +44,9 @@ $servidores = @(
 )
 
 $ScriptStartTime = Get-Date
+$TempFolder = "C:\TEMP\AuditDisk"
+$CollectorScript = "AuditCollect.ps1"
+$ResultFile = "audit_result.xml"
 
 # --- Funcoes ---
 
@@ -55,159 +61,207 @@ function Write-Log {
     Write-Host "[$timestamp] [$Level] $Message" -ForegroundColor $colors[$Level]
 }
 
+function Install-PsExec {
+    param([string]$DestPath)
+
+    $psExecExe = Join-Path $DestPath "PsExec.exe"
+    if (Test-Path $psExecExe) {
+        Write-Log "PsExec encontrado: $psExecExe" "OK"
+        return $psExecExe
+    }
+
+    Write-Log "A descarregar PsExec do Sysinternals..." "INFO"
+    $zipUrl = "https://download.sysinternals.com/files/PSTools.zip"
+    $zipPath = Join-Path $DestPath "PSTools.zip"
+
+    if (-not (Test-Path $DestPath)) {
+        New-Item -ItemType Directory -Path $DestPath -Force | Out-Null
+    }
+
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath -UseBasicParsing -ErrorAction Stop
+        Expand-Archive -Path $zipPath -DestinationPath $DestPath -Force
+        Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+        if (Test-Path $psExecExe) {
+            Write-Log "PsExec instalado: $psExecExe" "OK"
+            return $psExecExe
+        } else {
+            Write-Log "PsExec.exe nao encontrado apos extraccao" "ERROR"
+            return $null
+        }
+    }
+    catch {
+        Write-Log "Erro ao descarregar PsExec: $($_.Exception.Message)" "ERROR"
+        return $null
+    }
+}
+
 function Test-ServerConnectivity {
-    param(
-        [string[]]$Servers,
-        [PSCredential]$Credential
-    )
+    param([string[]]$Servers)
     $online = @()
     $offline = @()
 
     foreach ($srv in $Servers) {
-        Write-Log "A testar conectividade: $srv ..." "INFO"
-        try {
-            $wsmanParams = @{ ComputerName = $srv; ErrorAction = "Stop" }
-            if ($Credential) { $wsmanParams.Credential = $Credential }
-            $wsmanResult = Test-WSMan @wsmanParams
-            if ($wsmanResult) {
-                Write-Log "$srv - ONLINE" "OK"
-                $online += $srv
-            }
+        Write-Log "A testar: $srv ..." "INFO"
+        # Testar ping primeiro
+        $ping = Test-Connection -ComputerName $srv -Count 1 -Quiet -ErrorAction SilentlyContinue
+        if (-not $ping) {
+            Write-Log "$srv - SEM RESPOSTA (ping)" "WARN"
+            $offline += @{ Name = $srv; Error = "Sem resposta ao ping" }
+            continue
         }
-        catch {
-            Write-Log "$srv - OFFLINE ou inacessivel: $($_.Exception.Message)" "WARN"
-            $offline += @{ Name = $srv; Error = $_.Exception.Message }
+        # Testar admin share
+        $adminShare = "\\$srv\C`$"
+        if (Test-Path $adminShare -ErrorAction SilentlyContinue) {
+            Write-Log "$srv - ONLINE (ping + admin share)" "OK"
+            $online += $srv
+        } else {
+            Write-Log "$srv - PING OK mas admin share inacessivel" "WARN"
+            $offline += @{ Name = $srv; Error = "Admin share (C$) inacessivel" }
         }
     }
 
-    return @{
-        Online  = $online
-        Offline = $offline
-    }
+    return @{ Online = $online; Offline = $offline }
 }
 
-# --- ScriptBlock remoto (corre em cada PC) ---
-$RemoteScriptBlock = {
-    param([int]$TopFiles, [int]$TopFolders)
+function New-CollectorScript {
+    param([string]$OutputPath)
 
-    $result = @{
-        ComputerName = $env:COMPUTERNAME
-        Disks        = @()
-        TopFiles     = @()
-        TopFolders   = @()
-        Errors       = @()
+    $script = @'
+param([int]$TopFiles = 50, [int]$TopFolders = 20, [string]$OutFile = "C:\TEMP\AuditDisk\audit_result.xml")
+
+$result = @{
+    ComputerName = $env:COMPUTERNAME
+    Disks        = @()
+    TopFiles     = @()
+    TopFolders   = @()
+    Errors       = @()
+}
+
+try {
+    $disks = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DriveType=3"
+    foreach ($disk in $disks) {
+        $totalGB = [math]::Round($disk.Size / 1GB, 2)
+        $freeGB  = [math]::Round($disk.FreeSpace / 1GB, 2)
+        $usedGB  = [math]::Round(($disk.Size - $disk.FreeSpace) / 1GB, 2)
+        $pctUsed = if ($disk.Size -gt 0) { [math]::Round(($disk.Size - $disk.FreeSpace) / $disk.Size * 100, 1) } else { 0 }
+        $result.Disks += @{
+            Drive = $disk.DeviceID; Label = $disk.VolumeName
+            TotalGB = $totalGB; FreeGB = $freeGB; UsedGB = $usedGB; PctUsed = $pctUsed
+        }
     }
+
+    $allFiles = @()
+    foreach ($disk in $disks) {
+        $dl = $disk.DeviceID + "\"
+        try {
+            $files = Get-ChildItem -Path $dl -Recurse -File -ErrorAction SilentlyContinue |
+                Sort-Object Length -Descending | Select-Object -First ($TopFiles * 2)
+            $allFiles += $files
+        } catch {
+            $result.Errors += "Erro ficheiros em ${dl}: $($_.Exception.Message)"
+        }
+    }
+    $result.TopFiles = @($allFiles | Sort-Object Length -Descending | Select-Object -First $TopFiles |
+        ForEach-Object {
+            @{ Path = $_.FullName; SizeMB = [math]::Round($_.Length / 1MB, 2)
+               LastModified = $_.LastWriteTime.ToString("yyyy-MM-dd HH:mm"); Extension = $_.Extension }
+        })
+
+    $allFolders = @()
+    foreach ($disk in $disks) {
+        $dl = $disk.DeviceID + "\"
+        try {
+            $topDirs = Get-ChildItem -Path $dl -Directory -ErrorAction SilentlyContinue
+            foreach ($dir in $topDirs) {
+                try {
+                    $items = Get-ChildItem -Path $dir.FullName -Recurse -File -ErrorAction SilentlyContinue
+                    $sz = ($items | Measure-Object -Property Length -Sum).Sum
+                    $fc = ($items | Measure-Object).Count
+                    if ($null -eq $sz) { $sz = 0 }
+                    $allFolders += @{ Path = $dir.FullName; SizeMB = [math]::Round($sz / 1MB, 2); FileCount = $fc }
+                } catch {}
+            }
+            foreach ($dir in $topDirs) {
+                try {
+                    $subDirs = Get-ChildItem -Path $dir.FullName -Directory -ErrorAction SilentlyContinue
+                    foreach ($sub in $subDirs) {
+                        try {
+                            $items = Get-ChildItem -Path $sub.FullName -Recurse -File -ErrorAction SilentlyContinue
+                            $sz = ($items | Measure-Object -Property Length -Sum).Sum
+                            $fc = ($items | Measure-Object).Count
+                            if ($null -eq $sz) { $sz = 0 }
+                            $allFolders += @{ Path = $sub.FullName; SizeMB = [math]::Round($sz / 1MB, 2); FileCount = $fc }
+                        } catch {}
+                    }
+                } catch {}
+            }
+        } catch {
+            $result.Errors += "Erro pastas em ${dl}: $($_.Exception.Message)"
+        }
+    }
+    $result.TopFolders = @($allFolders | Sort-Object { $_.SizeMB } -Descending | Select-Object -First $TopFolders)
+} catch {
+    $result.Errors += "Erro geral: $($_.Exception.Message)"
+}
+
+$result | Export-Clixml -Path $OutFile -Force
+'@
+
+    $script | Out-File -FilePath $OutputPath -Encoding ASCII -Force
+}
+
+function Invoke-RemoteAudit {
+    param(
+        [string]$Server,
+        [string]$PsExecExe,
+        [int]$TopFiles,
+        [int]$TopFolders,
+        [int]$TimeoutSec
+    )
+
+    $remoteTempDir = "\\$Server\C`$\TEMP\AuditDisk"
+    $remoteScript  = "\\$Server\C`$\TEMP\AuditDisk\$CollectorScript"
+    $remoteResult  = "\\$Server\C`$\TEMP\AuditDisk\$ResultFile"
+    $localCollector = Join-Path $TempFolder $CollectorScript
 
     try {
-        # Discos fixos (DriveType 3 = Local Disk)
-        $disks = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DriveType=3"
-        foreach ($disk in $disks) {
-            $totalGB = [math]::Round($disk.Size / 1GB, 2)
-            $freeGB  = [math]::Round($disk.FreeSpace / 1GB, 2)
-            $usedGB  = [math]::Round(($disk.Size - $disk.FreeSpace) / 1GB, 2)
-            $pctUsed = if ($disk.Size -gt 0) { [math]::Round(($disk.Size - $disk.FreeSpace) / $disk.Size * 100, 1) } else { 0 }
-
-            $result.Disks += @{
-                Drive    = $disk.DeviceID
-                Label    = $disk.VolumeName
-                TotalGB  = $totalGB
-                FreeGB   = $freeGB
-                UsedGB   = $usedGB
-                PctUsed  = $pctUsed
-            }
+        # Criar pasta remota e copiar script
+        if (-not (Test-Path $remoteTempDir)) {
+            New-Item -ItemType Directory -Path $remoteTempDir -Force | Out-Null
         }
+        Copy-Item -Path $localCollector -Destination $remoteScript -Force
 
-        # Top ficheiros maiores (todos os discos fixos)
-        $allFiles = @()
-        foreach ($disk in $disks) {
-            $driveLetter = $disk.DeviceID + "\"
-            try {
-                $files = Get-ChildItem -Path $driveLetter -Recurse -File -ErrorAction SilentlyContinue |
-                    Sort-Object -Property Length -Descending |
-                    Select-Object -First ($TopFiles * 2)
-                $allFiles += $files
+        # Executar via PsExec
+        $psArgs = "\\$Server -accepteula -nobanner -h powershell.exe -ExecutionPolicy Bypass -File C:\TEMP\AuditDisk\$CollectorScript -TopFiles $TopFiles -TopFolders $TopFolders -OutFile C:\TEMP\AuditDisk\$ResultFile"
+        $proc = Start-Process -FilePath $PsExecExe -ArgumentList $psArgs -NoNewWindow -Wait -PassThru -RedirectStandardError "$env:TEMP\psexec_err_$Server.txt"
+
+        # Esperar e ler resultado
+        if ($proc.ExitCode -eq 0 -and (Test-Path $remoteResult)) {
+            $data = Import-Clixml -Path $remoteResult
+            return $data
+        } else {
+            $errContent = ""
+            $errFile = "$env:TEMP\psexec_err_$Server.txt"
+            if (Test-Path $errFile) {
+                $errContent = Get-Content $errFile -Raw -ErrorAction SilentlyContinue
+                Remove-Item $errFile -Force -ErrorAction SilentlyContinue
             }
-            catch {
-                $result.Errors += "Erro a listar ficheiros em ${driveLetter}: $($_.Exception.Message)"
-            }
+            return @{ ComputerName = $Server; Error = "PsExec exit code: $($proc.ExitCode). $errContent" }
         }
-
-        $result.TopFiles = $allFiles |
-            Sort-Object -Property Length -Descending |
-            Select-Object -First $TopFiles |
-            ForEach-Object {
-                @{
-                    Path         = $_.FullName
-                    SizeMB       = [math]::Round($_.Length / 1MB, 2)
-                    LastModified = $_.LastWriteTime.ToString("yyyy-MM-dd HH:mm")
-                    Extension    = $_.Extension
-                }
-            }
-
-        # Top pastas maiores
-        $allFolders = @()
-        foreach ($disk in $disks) {
-            $driveLetter = $disk.DeviceID + "\"
-            try {
-                # Pastas de primeiro nivel
-                $topDirs = Get-ChildItem -Path $driveLetter -Directory -ErrorAction SilentlyContinue
-                foreach ($dir in $topDirs) {
-                    try {
-                        $items = Get-ChildItem -Path $dir.FullName -Recurse -File -ErrorAction SilentlyContinue
-                        $totalSize = ($items | Measure-Object -Property Length -Sum).Sum
-                        $fileCount = ($items | Measure-Object).Count
-                        if ($null -eq $totalSize) { $totalSize = 0 }
-                        $allFolders += @{
-                            Path      = $dir.FullName
-                            SizeMB    = [math]::Round($totalSize / 1MB, 2)
-                            FileCount = $fileCount
-                        }
-                    }
-                    catch {
-                        # Ignorar pastas sem permissao
-                    }
-                }
-
-                # Sub-pastas de segundo nivel (para melhor granularidade)
-                foreach ($dir in $topDirs) {
-                    try {
-                        $subDirs = Get-ChildItem -Path $dir.FullName -Directory -ErrorAction SilentlyContinue
-                        foreach ($sub in $subDirs) {
-                            try {
-                                $items = Get-ChildItem -Path $sub.FullName -Recurse -File -ErrorAction SilentlyContinue
-                                $totalSize = ($items | Measure-Object -Property Length -Sum).Sum
-                                $fileCount = ($items | Measure-Object).Count
-                                if ($null -eq $totalSize) { $totalSize = 0 }
-                                $allFolders += @{
-                                    Path      = $sub.FullName
-                                    SizeMB    = [math]::Round($totalSize / 1MB, 2)
-                                    FileCount = $fileCount
-                                }
-                            }
-                            catch {
-                                # Ignorar pastas sem permissao
-                            }
-                        }
-                    }
-                    catch {
-                        # Ignorar
-                    }
-                }
-            }
-            catch {
-                $result.Errors += "Erro a listar pastas em ${driveLetter}: $($_.Exception.Message)"
-            }
-        }
-
-        $result.TopFolders = $allFolders |
-            Sort-Object -Descending { $_.SizeMB } |
-            Select-Object -First $TopFolders
     }
     catch {
-        $result.Errors += "Erro geral: $($_.Exception.Message)"
+        return @{ ComputerName = $Server; Error = $_.Exception.Message }
     }
-
-    return $result
+    finally {
+        # Limpar ficheiros remotos
+        Remove-Item $remoteResult -Force -ErrorAction SilentlyContinue
+        Remove-Item $remoteScript -Force -ErrorAction SilentlyContinue
+        Remove-Item $remoteTempDir -Force -Recurse -ErrorAction SilentlyContinue
+        $errFile = "$env:TEMP\psexec_err_$Server.txt"
+        Remove-Item $errFile -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function New-HtmlReport {
@@ -255,7 +309,6 @@ function New-HtmlReport {
     .disk-red { background-color: #fadbd8; }
     .error-section { background: #fadbd8; padding: 15px; border-radius: 8px; margin-bottom: 20px; border-left: 4px solid #e74c3c; }
     .error-section h2 { color: #c0392b; border-bottom-color: #e74c3c; }
-    .pc-name { font-weight: bold; color: #2980b9; }
     .size-large { color: #e74c3c; font-weight: bold; }
     .size-medium { color: #e67e22; }
     .size-small { color: #27ae60; }
@@ -314,7 +367,6 @@ function toggleSection(id) {
     </div>
 "@
 
-    # Seccao de erros (PCs offline)
     if ($OfflineServers.Count -gt 0) {
         $html += @"
 
@@ -329,7 +381,6 @@ function toggleSection(id) {
         $html += "        </table>`n    </div>`n"
     }
 
-    # Seccao por loja
     $sectionId = 0
     foreach ($shopId in ($grouped.Keys | Sort-Object)) {
         $shopPCs = $grouped[$shopId]
@@ -343,7 +394,6 @@ function toggleSection(id) {
             $sectionId++
             $pcName = $pc.ComputerName
 
-            # Tabela de discos
             $html += @"
         <h3 class="collapsible" onclick="toggleSection('sec$sectionId')">$pcName</h3>
         <div id="sec$sectionId" class="collapsible-content">
@@ -357,7 +407,6 @@ function toggleSection(id) {
             }
             $html += "        </table>`n"
 
-            # Tabela de top ficheiros
             $html += @"
         <h4>Top $($pc.TopFiles.Count) Ficheiros Maiores</h4>
         <table>
@@ -371,7 +420,6 @@ function toggleSection(id) {
             }
             $html += "        </table>`n"
 
-            # Tabela de top pastas
             $html += @"
         <h4>Top $($pc.TopFolders.Count) Pastas Maiores</h4>
         <table>
@@ -385,7 +433,6 @@ function toggleSection(id) {
             }
             $html += "        </table>`n"
 
-            # Erros do PC
             if ($pc.Errors.Count -gt 0) {
                 $html += "        <h4>Erros</h4><ul>`n"
                 foreach ($err in $pc.Errors) {
@@ -417,24 +464,43 @@ function toggleSection(id) {
 Write-Host ""
 Write-Host "============================================" -ForegroundColor Cyan
 Write-Host "  AUDITORIA DE DISCO - LOJAS ARTSANA" -ForegroundColor Cyan
+Write-Host "  (via PsExec)" -ForegroundColor Cyan
 Write-Host "============================================" -ForegroundColor Cyan
 Write-Host ""
 Write-Log "Inicio da auditoria. $($servidores.Count) servidores configurados." "INFO"
-Write-Log "Parametros: TopFiles=$TopFiles | TopFolders=$TopFolders | Timeout=${TimeoutMinutes}min" "INFO"
+Write-Log "Parametros: TopFiles=$TopFiles | TopFolders=$TopFolders | Timeout=${TimeoutSeconds}s | Paralelo=$MaxParallel" "INFO"
 
-# --- FASE 1: Credenciais ---
+# --- FASE 1: PsExec ---
 Write-Host ""
-Write-Log "FASE 1 - Credenciais" "INFO"
-if (-not $Credential) {
-    Write-Log "A usar sessao Windows actual (Kerberos): $env:USERDOMAIN\$env:USERNAME" "OK"
+Write-Log "FASE 1 - Verificar PsExec" "INFO"
+
+if ($PsExecPath -and (Test-Path $PsExecPath)) {
+    $psExecExe = $PsExecPath
+    Write-Log "PsExec fornecido: $psExecExe" "OK"
 } else {
-    Write-Log "Credenciais explicitas para: $($Credential.UserName)" "OK"
+    $toolsDir = Join-Path $PSScriptRoot "Tools"
+    $psExecExe = Install-PsExec -DestPath $toolsDir
+    if (-not $psExecExe) {
+        Write-Log "Impossivel obter PsExec. A sair." "ERROR"
+        exit 1
+    }
 }
 
-# --- FASE 2: Teste de Conectividade ---
+# --- FASE 2: Preparar script de recolha ---
 Write-Host ""
-Write-Log "FASE 2 - Teste de conectividade a $($servidores.Count) servidores..." "INFO"
-$connectivity = Test-ServerConnectivity -Servers $servidores -Credential $Credential
+Write-Log "FASE 2 - Preparar script de recolha local" "INFO"
+
+if (-not (Test-Path $TempFolder)) {
+    New-Item -ItemType Directory -Path $TempFolder -Force | Out-Null
+}
+$localCollector = Join-Path $TempFolder $CollectorScript
+New-CollectorScript -OutputPath $localCollector
+Write-Log "Script de recolha criado: $localCollector" "OK"
+
+# --- FASE 3: Teste de Conectividade ---
+Write-Host ""
+Write-Log "FASE 3 - Teste de conectividade a $($servidores.Count) servidores..." "INFO"
+$connectivity = Test-ServerConnectivity -Servers $servidores
 $onlineServers = $connectivity.Online
 $offlineServers = $connectivity.Offline
 
@@ -445,55 +511,113 @@ if ($onlineServers.Count -eq 0) {
     exit 1
 }
 
-# --- FASE 3: Recolha de dados (paralelo) ---
+# --- FASE 4: Recolha de dados (paralelo com throttle) ---
 Write-Host ""
-Write-Log "FASE 3 - A lancar recolha de dados em $($onlineServers.Count) PCs (paralelo)..." "INFO"
-
-$invokeParams = @{
-    ComputerName = $onlineServers
-    ScriptBlock  = $RemoteScriptBlock
-    ArgumentList = @($TopFiles, $TopFolders)
-    AsJob        = $true
-    JobName      = "ShopDiskAudit"
-}
-if ($Credential) { $invokeParams.Credential = $Credential }
-$jobs = Invoke-Command @invokeParams
-
-Write-Log "Jobs lancados. A aguardar resultados (timeout: ${TimeoutMinutes} minutos)..." "INFO"
-
-$null = Wait-Job -Job $jobs -Timeout ($TimeoutMinutes * 60)
+Write-Log "FASE 4 - A lancar recolha em $($onlineServers.Count) PCs (max $MaxParallel em paralelo)..." "INFO"
 
 $results = @()
+$jobList = @()
 
-foreach ($childJob in $jobs.ChildJobs) {
-    if ($childJob.State -eq "Completed") {
-        $data = Receive-Job -Job $childJob
-        if ($data) {
-            $results += $data
-            Write-Log "$($data.ComputerName) - dados recolhidos" "OK"
+foreach ($srv in $onlineServers) {
+    # Controlar paralelismo
+    while (($jobList | Where-Object { $_.State -eq "Running" }).Count -ge $MaxParallel) {
+        Start-Sleep -Milliseconds 500
+    }
+
+    Write-Log "A lancar: $srv" "INFO"
+    $job = Start-Job -ScriptBlock {
+        param($Server, $PsExec, $TFiles, $TFolders, $TSec, $TFolder, $CScript, $RFile)
+
+        $remoteTempDir = "\\$Server\C`$\TEMP\AuditDisk"
+        $remoteScript  = "\\$Server\C`$\TEMP\AuditDisk\$CScript"
+        $remoteResult  = "\\$Server\C`$\TEMP\AuditDisk\$RFile"
+        $localCollector = Join-Path $TFolder $CScript
+
+        try {
+            if (-not (Test-Path $remoteTempDir)) {
+                New-Item -ItemType Directory -Path $remoteTempDir -Force | Out-Null
+            }
+            Copy-Item -Path $localCollector -Destination $remoteScript -Force
+
+            $psArgs = @("\\$Server", "-accepteula", "-nobanner", "-h",
+                "powershell.exe", "-ExecutionPolicy", "Bypass",
+                "-File", "C:\TEMP\AuditDisk\$CScript",
+                "-TopFiles", $TFiles, "-TopFolders", $TFolders,
+                "-OutFile", "C:\TEMP\AuditDisk\$RFile")
+
+            $proc = Start-Process -FilePath $PsExec -ArgumentList $psArgs `
+                -NoNewWindow -Wait -PassThru `
+                -RedirectStandardOutput "NUL" `
+                -RedirectStandardError "$env:TEMP\psexec_err_$Server.txt"
+
+            if (Test-Path $remoteResult) {
+                $data = Import-Clixml -Path $remoteResult
+                return $data
+            } else {
+                $errContent = ""
+                if (Test-Path "$env:TEMP\psexec_err_$Server.txt") {
+                    $errContent = Get-Content "$env:TEMP\psexec_err_$Server.txt" -Raw -ErrorAction SilentlyContinue
+                }
+                return @{ ComputerName = $Server; Disks = @(); TopFiles = @(); TopFolders = @()
+                          Errors = @("PsExec exit: $($proc.ExitCode). $errContent") }
+            }
         }
-    }
-    elseif ($childJob.State -eq "Failed") {
-        $errMsg = $childJob.JobStateInfo.Reason.Message
-        $srvName = $childJob.Location
-        Write-Log "$srvName - FALHOU: $errMsg" "ERROR"
-        $offlineServers += @{ Name = $srvName; Error = "Job falhou: $errMsg" }
-    }
-    else {
-        $srvName = $childJob.Location
-        Write-Log "$srvName - TIMEOUT (estado: $($childJob.State))" "WARN"
-        $offlineServers += @{ Name = $srvName; Error = "Timeout apos $TimeoutMinutes minutos" }
-        Stop-Job -Job $childJob -ErrorAction SilentlyContinue
-    }
+        catch {
+            return @{ ComputerName = $Server; Disks = @(); TopFiles = @(); TopFolders = @()
+                      Errors = @("Erro: $($_.Exception.Message)") }
+        }
+        finally {
+            Remove-Item $remoteResult -Force -ErrorAction SilentlyContinue
+            Remove-Item $remoteScript -Force -ErrorAction SilentlyContinue
+            Remove-Item $remoteTempDir -Force -Recurse -ErrorAction SilentlyContinue
+            Remove-Item "$env:TEMP\psexec_err_$Server.txt" -Force -ErrorAction SilentlyContinue
+        }
+    } -ArgumentList $srv, $psExecExe, $TopFiles, $TopFolders, $TimeoutSeconds, $TempFolder, $CollectorScript, $ResultFile
+
+    $jobList += $job
 }
 
-Remove-Job -Job $jobs -Force -ErrorAction SilentlyContinue
+# Aguardar todos os jobs
+Write-Log "A aguardar conclusao de $($jobList.Count) jobs..." "INFO"
+$jobList | Wait-Job -Timeout $TimeoutSeconds | Out-Null
 
-Write-Log "Recolha concluida: $($results.Count) PCs com dados" "OK"
+foreach ($job in $jobList) {
+    if ($job.State -eq "Completed") {
+        $data = Receive-Job -Job $job
+        if ($data -and $data.ComputerName) {
+            $results += $data
+            $hasErrors = ($data.Errors -and $data.Errors.Count -gt 0)
+            if ($hasErrors -and $data.Disks.Count -eq 0) {
+                Write-Log "$($data.ComputerName) - FALHOU: $($data.Errors -join '; ')" "ERROR"
+            } else {
+                Write-Log "$($data.ComputerName) - dados recolhidos" "OK"
+            }
+        }
+    }
+    elseif ($job.State -eq "Running") {
+        Stop-Job -Job $job -ErrorAction SilentlyContinue
+        Write-Log "Job timeout - servidor desconhecido" "WARN"
+    }
+    else {
+        $errInfo = $job.ChildJobs[0].JobStateInfo.Reason.Message
+        Write-Log "Job falhou: $errInfo" "ERROR"
+    }
+    Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+}
 
-# --- FASE 4: Gerar relatorio HTML ---
+# Separar resultados validos dos falhados
+$validResults = @($results | Where-Object { $_.Disks -and $_.Disks.Count -gt 0 })
+$failedResults = @($results | Where-Object { -not $_.Disks -or $_.Disks.Count -eq 0 })
+
+foreach ($fail in $failedResults) {
+    $offlineServers += @{ Name = $fail.ComputerName; Error = ($fail.Errors -join "; ") }
+}
+
+Write-Log "Recolha concluida: $($validResults.Count) PCs com dados, $($failedResults.Count) falhados" "OK"
+
+# --- FASE 5: Gerar relatorio HTML ---
 Write-Host ""
-Write-Log "FASE 4 - A gerar relatorio HTML..." "INFO"
+Write-Log "FASE 5 - A gerar relatorio HTML..." "INFO"
 
 if (-not (Test-Path $ReportPath)) {
     New-Item -ItemType Directory -Path $ReportPath -Force | Out-Null
@@ -503,10 +627,13 @@ if (-not (Test-Path $ReportPath)) {
 $reportFileName = "AuditDisk_$(Get-Date -Format 'yyyy-MM-dd_HHmmss').html"
 $reportFullPath = Join-Path $ReportPath $reportFileName
 
-$htmlContent = New-HtmlReport -Results $results -OfflineServers $offlineServers -StartTime $ScriptStartTime
+$htmlContent = New-HtmlReport -Results $validResults -OfflineServers $offlineServers -StartTime $ScriptStartTime
 $htmlContent | Out-File -FilePath $reportFullPath -Encoding UTF8
 
 Write-Log "Relatorio gerado: $reportFullPath" "OK"
+
+# Limpar temp local
+Remove-Item $TempFolder -Recurse -Force -ErrorAction SilentlyContinue
 
 # Resumo final
 Write-Host ""
@@ -514,7 +641,7 @@ Write-Host "============================================" -ForegroundColor Green
 Write-Host "  AUDITORIA CONCLUIDA" -ForegroundColor Green
 Write-Host "============================================" -ForegroundColor Green
 Write-Host ""
-Write-Log "PCs auditados: $($results.Count)/$($servidores.Count)" "OK"
+Write-Log "PCs auditados: $($validResults.Count)/$($servidores.Count)" "OK"
 Write-Log "PCs offline/erro: $($offlineServers.Count)" $(if ($offlineServers.Count -gt 0) { "WARN" } else { "OK" })
 Write-Log "Relatorio: $reportFullPath" "OK"
 Write-Log "Duracao total: $([math]::Round(((Get-Date) - $ScriptStartTime).TotalMinutes, 1)) minutos" "INFO"
