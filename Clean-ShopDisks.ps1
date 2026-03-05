@@ -196,32 +196,14 @@ foreach ($target in $targetList) {
             }
             "UserProfiles" {
                 $totalFreed = 0; $totalCount = 0
-                $ptUsers = @(Get-ChildItem "C:\Users" -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "ptpos0*" })
-                foreach ($u in $ptUsers) {
-                    # Temp
-                    $tempPath = Join-Path $u.FullName "AppData\Local\Temp"
-                    $r = Remove-FolderContents -Path $tempPath -DryRun:$DryRun
-                    $totalFreed += $r.FreedMB; $totalCount += $r.Count
-                    # Downloads >5 days
-                    $dlPath = Join-Path $u.FullName "Downloads"
-                    if (Test-Path $dlPath) {
-                        $oldDl = Get-ChildItem -Path $dlPath -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-5) }
-                        $dlSize = ($oldDl | Measure-Object -Property Length -Sum).Sum
-                        $dlCount = ($oldDl | Measure-Object).Count
-                        if ($null -eq $dlSize) { $dlSize = 0 }
-                        if (-not $DryRun -and $dlCount -gt 0) {
-                            $oldDl | Remove-Item -Force -ErrorAction SilentlyContinue
-                        }
-                        $totalFreed += [math]::Round($dlSize / 1MB, 2); $totalCount += $dlCount
-                    }
-                }
-                # Recycle Bin
-                $rbRoot = "C:\`$Recycle.Bin"
-                if (Test-Path $rbRoot) {
-                    $r = Remove-FolderContents -Path $rbRoot -DryRun:$DryRun
+                $skipProfiles = @("Default", "Public", "defaultuser0", "Default User", "All Users")
+                $obsoleteUsers = @(Get-ChildItem "C:\Users" -Directory -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Name -notin $skipProfiles -and $_.Name -notlike "ptpos0*" -and $_.Name -ne "shpsuperpt" })
+                foreach ($u in $obsoleteUsers) {
+                    $r = Remove-FolderEntirely -Path $u.FullName -DryRun:$DryRun
                     $totalFreed += $r.FreedMB; $totalCount += $r.Count
                 }
-                $result.Actions += @{ Target = $target; Path = "C:\Users\ptpos0* (Temp+Downloads+RecycleBin)"; FreedMB = [math]::Round($totalFreed, 2); FileCount = $totalCount; DryRun = $DryRun.IsPresent }
+                $result.Actions += @{ Target = $target; Path = "C:\Users (perfis obsoletos, $($obsoleteUsers.Count) perfis)"; FreedMB = [math]::Round($totalFreed, 2); FileCount = $totalCount; DryRun = $DryRun.IsPresent }
                 $result.TotalFreedMB += $totalFreed
             }
             "Drivers" {

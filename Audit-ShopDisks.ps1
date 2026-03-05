@@ -230,36 +230,19 @@ try {
         }
     }
 
-    # 2) UserProfiles - ptpos0* Temp + Downloads>5d + Recycle Bin
-    $upSz = 0; $upFc = 0
-    $ptUsers = @(Get-ChildItem "C:\Users" -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "ptpos0*" })
-    foreach ($u in $ptUsers) {
-        $tempPath = Join-Path $u.FullName "AppData\Local\Temp"
-        if (Test-Path $tempPath) { $t = Measure-CleanupPath $tempPath; $upSz += $t.SizeMB; $upFc += $t.FileCount }
-        $dlPath = Join-Path $u.FullName "Downloads"
-        if (Test-Path $dlPath) {
-            try {
-                $oldDl = Get-ChildItem -Path $dlPath -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-5) }
-                $dlSz = ($oldDl | Measure-Object -Property Length -Sum).Sum
-                $dlFc = ($oldDl | Measure-Object).Count
-                if ($null -eq $dlSz) { $dlSz = 0 }
-                $upSz += [math]::Round($dlSz / 1MB, 2); $upFc += $dlFc
-            } catch {}
-        }
+    # 2) UserProfiles - all profiles EXCEPT ptpos0*, shpsuperpt, and system profiles
+    $upSz = 0; $upFc = 0; $upNames = @()
+    $skipProfiles = @("Default", "Public", "defaultuser0", "Default User", "All Users")
+    $allUsers = @(Get-ChildItem "C:\Users" -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -notin $skipProfiles -and $_.Name -notlike "ptpos0*" -and $_.Name -ne "shpsuperpt" })
+    foreach ($u in $allUsers) {
+        $m = Measure-CleanupPath $u.FullName
+        if ($m.FileCount -gt 0) { $upSz += $m.SizeMB; $upFc += $m.FileCount; $upNames += $u.Name }
     }
-    # Recycle Bin (once, outside user loop)
-    $rbRoot = "C:\`$Recycle.Bin"
-    if (Test-Path $rbRoot) {
-        try {
-            $rbItems = Get-ChildItem -Path $rbRoot -Recurse -File -Force -ErrorAction SilentlyContinue
-            $rbSz = ($rbItems | Measure-Object -Property Length -Sum).Sum
-            $rbFc = ($rbItems | Measure-Object).Count
-            if ($null -eq $rbSz) { $rbSz = 0 }
-            $upSz += [math]::Round($rbSz / 1MB, 2); $upFc += $rbFc
-        } catch {}
-    }
-    if ($ptUsers.Count -gt 0 -and $upFc -gt 0) {
-        $result.CleanupTargets += @{ Id = "UserProfiles"; Name = "User Profiles (ptpos0*)"; SizeMB = [math]::Round($upSz, 2); FileCount = $upFc; Exists = $true }
+    if ($upFc -gt 0) {
+        $profileList = ($upNames | Select-Object -First 5) -join ", "
+        if ($upNames.Count -gt 5) { $profileList += " +$($upNames.Count - 5) mais" }
+        $result.CleanupTargets += @{ Id = "UserProfiles"; Name = "Perfis obsoletos ($profileList)"; SizeMB = [math]::Round($upSz, 2); FileCount = $upFc; Exists = $true }
     }
 
     # 3) Drivers
@@ -318,6 +301,8 @@ try {
     $result.Errors += "Erro geral: $($_.Exception.Message)"
 }
 
+$outDir = Split-Path $OutFile -Parent
+if (-not (Test-Path $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
 $result | Export-Clixml -Path $OutFile -Force
 '@
 
@@ -498,6 +483,16 @@ function toggleSection(id) {
         header.classList.add('collapsed');
     }
 }
+function openAndScroll(headerId) {
+    var header = document.getElementById(headerId);
+    if (!header) return;
+    var content = header.nextElementSibling;
+    if (content && content.classList.contains('hidden')) {
+        content.classList.remove('hidden');
+        header.classList.remove('collapsed');
+    }
+    header.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
 function toggleAllTargets(pcName, checked) {
     var cbs = document.querySelectorAll('.cleanup-cb[data-pc="' + pcName + '"]');
     for (var i = 0; i < cbs.length; i++) { cbs[i].checked = checked; }
@@ -593,7 +588,7 @@ function copyCommand() {
         $rankIdx++
         $rowClass = if ($stat.PctUsed -ge 85) { "disk-red" } elseif ($stat.PctUsed -ge 70) { "disk-yellow" } else { "disk-green" }
         $barClass = if ($stat.PctUsed -ge 85) { "bar-red" } elseif ($stat.PctUsed -ge 70) { "bar-yellow" } else { "bar-green" }
-        $html += "            <tr class=`"$rowClass`"><td>$rankIdx</td><td><strong>$($stat.ComputerName)</strong></td><td>$($stat.ShopId)</td><td>$($stat.TotalGB)</td><td>$($stat.UsedGB)</td><td>$($stat.FreeGB)</td><td>$($stat.PctUsed)%</td><td><div class=`"bar-container`"><div class=`"bar-fill $barClass`" style=`"width:$($stat.PctUsed)%`"></div></div></td></tr>`n"
+        $html += "            <tr class=`"$rowClass`"><td>$rankIdx</td><td><strong><a href=`"#detail-$($stat.ComputerName)`" style=`"color:inherit;text-decoration:underline`" onclick=`"openAndScroll('detail-$($stat.ComputerName)')`">$($stat.ComputerName)</a></strong></td><td>$($stat.ShopId)</td><td>$($stat.TotalGB)</td><td>$($stat.UsedGB)</td><td>$($stat.FreeGB)</td><td>$($stat.PctUsed)%</td><td><div class=`"bar-container`"><div class=`"bar-fill $barClass`" style=`"width:$($stat.PctUsed)%`"></div></div></td></tr>`n"
     }
     $html += @"
         </table>
@@ -664,8 +659,8 @@ function copyCommand() {
             $pcName = $pc.ComputerName
 
             $html += @"
-        <h3 class="collapsible" onclick="toggleSection('sec$sectionId')">$pcName</h3>
-        <div id="sec$sectionId" class="collapsible-content">
+        <h3 id="detail-$pcName" class="collapsible collapsed" onclick="toggleSection('sec$sectionId')">$pcName</h3>
+        <div id="sec$sectionId" class="collapsible-content hidden">
         <h4>Discos</h4>
         <table>
             <tr><th>Drive</th><th>Label</th><th>Total (GB)</th><th>Livre (GB)</th><th>Usado (GB)</th><th>% Usado</th></tr>
