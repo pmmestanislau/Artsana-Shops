@@ -135,11 +135,12 @@ function New-CollectorScript {
 param([int]$TopFiles = 50, [int]$TopFolders = 20, [string]$OutFile = "C:\TEMP\AuditDisk\audit_result.xml")
 
 $result = @{
-    ComputerName = $env:COMPUTERNAME
-    Disks        = @()
-    TopFiles     = @()
-    TopFolders   = @()
-    Errors       = @()
+    ComputerName   = $env:COMPUTERNAME
+    Disks          = @()
+    TopFiles       = @()
+    TopFolders     = @()
+    CleanupTargets = @()
+    Errors         = @()
 }
 
 try {
@@ -205,6 +206,115 @@ try {
         }
     }
     $result.TopFolders = @($allFolders | Sort-Object { $_.SizeMB } -Descending | Select-Object -First $TopFolders)
+
+    # --- Cleanup Targets Detection ---
+    function Measure-CleanupPath {
+        param([string]$Path)
+        $sz = 0; $fc = 0
+        if (Test-Path $Path) {
+            try {
+                $items = Get-ChildItem -Path $Path -Recurse -File -ErrorAction SilentlyContinue
+                $sz = ($items | Measure-Object -Property Length -Sum).Sum
+                $fc = ($items | Measure-Object).Count
+                if ($null -eq $sz) { $sz = 0 }
+            } catch {}
+        }
+        return @{ SizeMB = [math]::Round($sz / 1MB, 2); FileCount = $fc }
+    }
+
+    # 1) WindowsTemp
+    if (Test-Path "C:\Windows\Temp") {
+        $m = Measure-CleanupPath "C:\Windows\Temp"
+        if ($m.FileCount -gt 0) {
+            $result.CleanupTargets += @{ Id = "WindowsTemp"; Name = "Windows Temp"; SizeMB = $m.SizeMB; FileCount = $m.FileCount; Exists = $true }
+        }
+    }
+
+    # 2) UserProfiles - ptpos0* Temp + Downloads>5d + Recycle Bin
+    $upSz = 0; $upFc = 0
+    $ptUsers = @(Get-ChildItem "C:\Users" -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "ptpos0*" })
+    foreach ($u in $ptUsers) {
+        $tempPath = Join-Path $u.FullName "AppData\Local\Temp"
+        if (Test-Path $tempPath) { $t = Measure-CleanupPath $tempPath; $upSz += $t.SizeMB; $upFc += $t.FileCount }
+        $dlPath = Join-Path $u.FullName "Downloads"
+        if (Test-Path $dlPath) {
+            try {
+                $oldDl = Get-ChildItem -Path $dlPath -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-5) }
+                $dlSz = ($oldDl | Measure-Object -Property Length -Sum).Sum
+                $dlFc = ($oldDl | Measure-Object).Count
+                if ($null -eq $dlSz) { $dlSz = 0 }
+                $upSz += [math]::Round($dlSz / 1MB, 2); $upFc += $dlFc
+            } catch {}
+        }
+        $rbPath = Join-Path $u.FullName "AppData\Local\Microsoft\Windows\Explorer\*.db"
+        # Recycle Bin via hidden folder
+        $rbRoot = "C:\`$Recycle.Bin"
+        if (Test-Path $rbRoot) {
+            try {
+                $rbItems = Get-ChildItem -Path $rbRoot -Recurse -File -Force -ErrorAction SilentlyContinue
+                $rbSz = ($rbItems | Measure-Object -Property Length -Sum).Sum
+                $rbFc = ($rbItems | Measure-Object).Count
+                if ($null -eq $rbSz) { $rbSz = 0 }
+                $upSz += [math]::Round($rbSz / 1MB, 2); $upFc += $rbFc
+            } catch {}
+        }
+    }
+    if ($ptUsers.Count -gt 0 -and $upFc -gt 0) {
+        $result.CleanupTargets += @{ Id = "UserProfiles"; Name = "User Profiles (ptpos0*)"; SizeMB = [math]::Round($upSz, 2); FileCount = $upFc; Exists = $true }
+    }
+
+    # 3) Drivers
+    $driversSubs = @("MICROSOFT", "OTHER_SOFT", "SCRIPTS", "SISQUAL", "SOPHOS", "XSTORE_INSTALL")
+    $drSz = 0; $drFc = 0
+    foreach ($sub in $driversSubs) {
+        $p = "C:\Drivers\$sub"
+        if (Test-Path $p) { $t = Measure-CleanupPath $p; $drSz += $t.SizeMB; $drFc += $t.FileCount }
+    }
+    if ($drFc -gt 0) {
+        $result.CleanupTargets += @{ Id = "Drivers"; Name = "C:\Drivers (install leftovers)"; SizeMB = [math]::Round($drSz, 2); FileCount = $drFc; Exists = $true }
+    }
+
+    # 4) SoftwareInstall
+    $swSubs = @("SQL", "SCRIPTS", "OFFICE2013", "OFFICE365", "Xstore20")
+    $swSz = 0; $swFc = 0
+    foreach ($sub in $swSubs) {
+        $p = "C:\Software_InstallationPT\$sub"
+        if (Test-Path $p) { $t = Measure-CleanupPath $p; $swSz += $t.SizeMB; $swFc += $t.FileCount }
+    }
+    if ($swFc -gt 0) {
+        $result.CleanupTargets += @{ Id = "SoftwareInstall"; Name = "C:\Software_InstallationPT"; SizeMB = [math]::Round($swSz, 2); FileCount = $swFc; Exists = $true }
+    }
+
+    # 5) BACKUPxstore
+    if (Test-Path "C:\BACKUPxstore") {
+        $m = Measure-CleanupPath "C:\BACKUPxstore"
+        if ($m.FileCount -gt 0) {
+            $result.CleanupTargets += @{ Id = "BACKUPxstore"; Name = "C:\BACKUPxstore"; SizeMB = $m.SizeMB; FileCount = $m.FileCount; Exists = $true }
+        }
+    }
+
+    # 6) RetentionFolders - C:\scanner + C:\tmp\hh_upload >30 days
+    $rfSz = 0; $rfFc = 0
+    foreach ($rfPath in @("C:\scanner", "C:\tmp\hh_upload")) {
+        if (Test-Path $rfPath) {
+            try {
+                $oldItems = Get-ChildItem -Path $rfPath -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-30) }
+                $oSz = ($oldItems | Measure-Object -Property Length -Sum).Sum
+                $oFc = ($oldItems | Measure-Object).Count
+                if ($null -eq $oSz) { $oSz = 0 }
+                $rfSz += [math]::Round($oSz / 1MB, 2); $rfFc += $oFc
+            } catch {}
+        }
+    }
+    if ($rfFc -gt 0) {
+        $result.CleanupTargets += @{ Id = "RetentionFolders"; Name = "Retention (scanner/hh_upload >30d)"; SizeMB = [math]::Round($rfSz, 2); FileCount = $rfFc; Exists = $true }
+    }
+
+    # 7) WindowsOld
+    if (Test-Path "C:\Windows.old") {
+        $m = Measure-CleanupPath "C:\Windows.old"
+        $result.CleanupTargets += @{ Id = "WindowsOld"; Name = "C:\Windows.old"; SizeMB = $m.SizeMB; FileCount = $m.FileCount; Exists = $true }
+    }
 } catch {
     $result.Errors += "Erro geral: $($_.Exception.Message)"
 }
