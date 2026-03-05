@@ -469,6 +469,20 @@ function New-HtmlReport {
     .bar-green { background: #27ae60; }
     .bar-yellow { background: #f39c12; }
     .bar-red { background: #e74c3c; }
+    .cleanup-section { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 20px; border-left: 4px solid #8e44ad; }
+    .cleanup-section h2 { color: #8e44ad; border-bottom-color: #8e44ad; margin-top: 0; }
+    .cleanup-controls { display: flex; gap: 15px; align-items: center; margin: 10px 0; flex-wrap: wrap; }
+    .cleanup-btn { background: #8e44ad; color: white; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; font-size: 14px; }
+    .cleanup-btn:hover { background: #7d3c98; }
+    .cleanup-btn-copy { background: #27ae60; }
+    .cleanup-btn-copy:hover { background: #219a52; }
+    .cleanup-summary { background: #f4ecf7; padding: 12px 18px; border-radius: 6px; margin: 10px 0; font-size: 14px; }
+    .cleanup-summary strong { color: #8e44ad; }
+    .command-box { background: #2c3e50; color: #2ecc71; padding: 15px; border-radius: 6px; font-family: 'Consolas', 'Courier New', monospace; font-size: 13px; margin: 10px 0; white-space: pre-wrap; word-break: break-all; display: none; }
+    .cleanup-cb-cell { text-align: center; }
+    .cleanup-cb { width: 18px; height: 18px; cursor: pointer; }
+    .pc-header-row { background: #eaf2f8 !important; font-weight: bold; }
+    .pc-header-row td { border-top: 2px solid #8e44ad; }
 </style>
 "@
 
@@ -484,6 +498,57 @@ function toggleSection(id) {
         el.classList.add('hidden');
         header.classList.add('collapsed');
     }
+}
+function toggleAllTargets(pcName, checked) {
+    var cbs = document.querySelectorAll('.cleanup-cb[data-pc="' + pcName + '"]');
+    for (var i = 0; i < cbs.length; i++) { cbs[i].checked = checked; }
+    updateSummary();
+}
+function toggleAllPCs(checked) {
+    var cbs = document.querySelectorAll('.cleanup-cb');
+    for (var i = 0; i < cbs.length; i++) { cbs[i].checked = checked; }
+    var pcCbs = document.querySelectorAll('.cleanup-pc-all');
+    for (var i = 0; i < pcCbs.length; i++) { pcCbs[i].checked = checked; }
+    updateSummary();
+}
+function updateSummary() {
+    var cbs = document.querySelectorAll('.cleanup-cb:checked');
+    var pcs = {}; var targets = 0; var totalMB = 0;
+    for (var i = 0; i < cbs.length; i++) {
+        pcs[cbs[i].getAttribute('data-pc')] = true;
+        targets++;
+        totalMB += parseFloat(cbs[i].getAttribute('data-size') || 0);
+    }
+    var pcCount = Object.keys(pcs).length;
+    var gb = (totalMB / 1024).toFixed(1);
+    var el = document.getElementById('cleanupSummary');
+    if (el) {
+        el.innerHTML = '<strong>' + pcCount + '</strong> PCs | <strong>' + targets + '</strong> targets | <strong>' + gb + ' GB</strong> estimados para limpeza';
+    }
+}
+function generateCommand() {
+    var cbs = document.querySelectorAll('.cleanup-cb:checked');
+    if (cbs.length === 0) { alert('Selecione pelo menos um target.'); return; }
+    var pcs = {}; var targets = {};
+    for (var i = 0; i < cbs.length; i++) {
+        pcs[cbs[i].getAttribute('data-pc')] = true;
+        targets[cbs[i].getAttribute('data-target')] = true;
+    }
+    var pcList = Object.keys(pcs).sort().join(',');
+    var targetList = Object.keys(targets).sort().join(',');
+    var cmd = '.\\Clean-ShopDisks.ps1 -Computers "' + pcList + '" -Targets "' + targetList + '" -WhatIf';
+    var box = document.getElementById('commandBox');
+    box.textContent = cmd;
+    box.style.display = 'block';
+    document.getElementById('copyBtn').style.display = 'inline-block';
+}
+function copyCommand() {
+    var cmd = document.getElementById('commandBox').textContent;
+    navigator.clipboard.writeText(cmd).then(function() {
+        var btn = document.getElementById('copyBtn');
+        btn.textContent = 'Copiado!';
+        setTimeout(function() { btn.textContent = 'Copiar Comando'; }, 2000);
+    });
 }
 </script>
 "@
@@ -535,6 +600,42 @@ function toggleSection(id) {
         </table>
     </div>
 "@
+
+    # --- Cleanup Analysis Section ---
+    $cleanupPCs = @($Results | Where-Object { $_.CleanupTargets -and $_.CleanupTargets.Count -gt 0 })
+    if ($cleanupPCs.Count -gt 0) {
+        # Ordenar PCs por tamanho total de cleanup (maior primeiro)
+        $cleanupPCs = $cleanupPCs | Sort-Object { ($_.CleanupTargets | ForEach-Object { $_.SizeMB } | Measure-Object -Sum).Sum } -Descending
+
+        $html += @"
+
+    <div class="cleanup-section">
+        <h2>Analise de Cleanup</h2>
+        <div class="cleanup-controls">
+            <label><input type="checkbox" onchange="toggleAllPCs(this.checked)"> <strong>Selecionar Todos</strong></label>
+        </div>
+        <div class="cleanup-summary" id="cleanupSummary"><strong>0</strong> PCs | <strong>0</strong> targets | <strong>0.0 GB</strong> estimados para limpeza</div>
+        <table>
+            <tr><th class="cleanup-cb-cell" style="width:40px"></th><th>Computador</th><th>Target</th><th>Tamanho (MB)</th><th>Ficheiros</th></tr>
+"@
+        foreach ($pc in $cleanupPCs) {
+            $pcName = $pc.ComputerName
+            $pcTotalMB = [math]::Round(($pc.CleanupTargets | ForEach-Object { $_.SizeMB } | Measure-Object -Sum).Sum, 1)
+            $html += "            <tr class=`"pc-header-row`"><td class=`"cleanup-cb-cell`"><input type=`"checkbox`" class=`"cleanup-pc-all`" onchange=`"toggleAllTargets('$pcName', this.checked)`"></td><td colspan=`"2`"><strong>$pcName</strong></td><td><strong>$pcTotalMB</strong></td><td></td></tr>`n"
+            foreach ($t in ($pc.CleanupTargets | Sort-Object { $_.SizeMB } -Descending)) {
+                $html += "            <tr><td class=`"cleanup-cb-cell`"><input type=`"checkbox`" class=`"cleanup-cb`" data-pc=`"$pcName`" data-target=`"$($t.Id)`" data-size=`"$($t.SizeMB)`" onchange=`"updateSummary()`"></td><td></td><td>$($t.Name)</td><td>$($t.SizeMB)</td><td>$($t.FileCount)</td></tr>`n"
+            }
+        }
+        $html += @"
+        </table>
+        <div class="cleanup-controls" style="margin-top:15px">
+            <button class="cleanup-btn" onclick="generateCommand()">Gerar Comando PowerShell</button>
+            <button class="cleanup-btn cleanup-btn-copy" id="copyBtn" onclick="copyCommand()" style="display:none">Copiar Comando</button>
+        </div>
+        <div class="command-box" id="commandBox"></div>
+    </div>
+"@
+    }
 
     if ($OfflineServers.Count -gt 0) {
         $html += @"
