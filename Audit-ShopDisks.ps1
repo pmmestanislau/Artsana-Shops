@@ -246,18 +246,17 @@ try {
                 $upSz += [math]::Round($dlSz / 1MB, 2); $upFc += $dlFc
             } catch {}
         }
-        $rbPath = Join-Path $u.FullName "AppData\Local\Microsoft\Windows\Explorer\*.db"
-        # Recycle Bin via hidden folder
-        $rbRoot = "C:\`$Recycle.Bin"
-        if (Test-Path $rbRoot) {
-            try {
-                $rbItems = Get-ChildItem -Path $rbRoot -Recurse -File -Force -ErrorAction SilentlyContinue
-                $rbSz = ($rbItems | Measure-Object -Property Length -Sum).Sum
-                $rbFc = ($rbItems | Measure-Object).Count
-                if ($null -eq $rbSz) { $rbSz = 0 }
-                $upSz += [math]::Round($rbSz / 1MB, 2); $upFc += $rbFc
-            } catch {}
-        }
+    }
+    # Recycle Bin (once, outside user loop)
+    $rbRoot = "C:\`$Recycle.Bin"
+    if (Test-Path $rbRoot) {
+        try {
+            $rbItems = Get-ChildItem -Path $rbRoot -Recurse -File -Force -ErrorAction SilentlyContinue
+            $rbSz = ($rbItems | Measure-Object -Property Length -Sum).Sum
+            $rbFc = ($rbItems | Measure-Object).Count
+            if ($null -eq $rbSz) { $rbSz = 0 }
+            $upSz += [math]::Round($rbSz / 1MB, 2); $upFc += $rbFc
+        } catch {}
     }
     if ($ptUsers.Count -gt 0 -and $upFc -gt 0) {
         $result.CleanupTargets += @{ Id = "UserProfiles"; Name = "User Profiles (ptpos0*)"; SizeMB = [math]::Round($upSz, 2); FileCount = $upFc; Exists = $true }
