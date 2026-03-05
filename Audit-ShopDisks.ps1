@@ -319,12 +319,6 @@ function New-HtmlReport {
     }
     $orderedShopIds = $shopFreeAvg.GetEnumerator() | Sort-Object Value | ForEach-Object { $_.Key }
 
-    # Totais globais
-    $globalTotalGB = [math]::Round(($pcStats | ForEach-Object { $_.TotalGB } | Measure-Object -Sum).Sum, 1)
-    $globalFreeGB  = [math]::Round(($pcStats | ForEach-Object { $_.FreeGB }  | Measure-Object -Sum).Sum, 1)
-    $globalUsedGB  = [math]::Round(($pcStats | ForEach-Object { $_.UsedGB }  | Measure-Object -Sum).Sum, 1)
-    $globalPctUsed = if ($globalTotalGB -gt 0) { [math]::Round($globalUsedGB / $globalTotalGB * 100, 1) } else { 0 }
-
     $css = @"
 <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -365,10 +359,6 @@ function New-HtmlReport {
     .bar-green { background: #27ae60; }
     .bar-yellow { background: #f39c12; }
     .bar-red { background: #e74c3c; }
-    .global-stats { display: flex; gap: 15px; margin: 15px 0; flex-wrap: wrap; }
-    .global-stat { background: #2c3e50; color: white; padding: 15px 20px; border-radius: 8px; min-width: 180px; }
-    .global-stat .number { font-size: 22px; font-weight: bold; }
-    .global-stat .label { font-size: 11px; color: #bdc3c7; text-transform: uppercase; }
 </style>
 "@
 
@@ -415,21 +405,6 @@ function toggleSection(id) {
         <div class="summary-card">
             <div class="number">$($grouped.Keys.Count)</div>
             <div class="label">Lojas</div>
-        </div>
-    </div>
-
-    <div class="global-stats">
-        <div class="global-stat">
-            <div class="number">$globalTotalGB GB</div>
-            <div class="label">Total Disco (todas as lojas)</div>
-        </div>
-        <div class="global-stat">
-            <div class="number">$globalUsedGB GB</div>
-            <div class="label">Espaco Usado</div>
-        </div>
-        <div class="global-stat" style="background: $(if ($globalPctUsed -ge 85) { '#e74c3c' } elseif ($globalPctUsed -ge 70) { '#f39c12' } else { '#27ae60' })">
-            <div class="number">$globalFreeGB GB</div>
-            <div class="label">Espaco Livre ($globalPctUsed% usado)</div>
         </div>
     </div>
 
