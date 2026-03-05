@@ -287,36 +287,42 @@ function New-HtmlReport {
         $grouped[$shopId] += $r
     }
 
-    # Calcular totais por loja e ordenar por menos espaco livre
-    $shopStats = @()
-    foreach ($shopId in $grouped.Keys) {
-        $shopPCs = $grouped[$shopId]
+    # Calcular totais por PC e ordenar por menos espaco livre
+    $pcStats = @()
+    foreach ($r in $Results) {
+        $shopId = $r.ComputerName -replace '(PT\d{4}).*', '$1'
         $totalGB = 0; $freeGB = 0; $usedGB = 0
-        foreach ($pc in $shopPCs) {
-            foreach ($disk in $pc.Disks) {
-                $totalGB += $disk.TotalGB
-                $freeGB  += $disk.FreeGB
-                $usedGB  += $disk.UsedGB
-            }
+        foreach ($disk in $r.Disks) {
+            $totalGB += $disk.TotalGB
+            $freeGB  += $disk.FreeGB
+            $usedGB  += $disk.UsedGB
         }
         $pctUsed = if ($totalGB -gt 0) { [math]::Round($usedGB / $totalGB * 100, 1) } else { 0 }
-        $shopStats += @{
-            ShopId  = $shopId
-            PCs     = $shopPCs.Count
-            TotalGB = [math]::Round($totalGB, 1)
-            FreeGB  = [math]::Round($freeGB, 1)
-            UsedGB  = [math]::Round($usedGB, 1)
-            PctUsed = $pctUsed
+        $pcStats += @{
+            ComputerName = $r.ComputerName
+            ShopId       = $shopId
+            TotalGB      = [math]::Round($totalGB, 1)
+            FreeGB       = [math]::Round($freeGB, 1)
+            UsedGB       = [math]::Round($usedGB, 1)
+            PctUsed      = $pctUsed
         }
     }
     # Ordenar: menos espaco livre primeiro (mais critico no topo)
-    $shopStats = $shopStats | Sort-Object { $_.FreeGB }
-    $orderedShopIds = $shopStats | ForEach-Object { $_.ShopId }
+    $pcStats = $pcStats | Sort-Object { $_.FreeGB }
+
+    # Ordenar lojas pela media de espaco livre dos seus PCs
+    $shopFreeAvg = @{}
+    foreach ($shopId in $grouped.Keys) {
+        $shopPCStats = @($pcStats | Where-Object { $_.ShopId -eq $shopId })
+        $avgFree = ($shopPCStats | ForEach-Object { $_.FreeGB } | Measure-Object -Average).Average
+        $shopFreeAvg[$shopId] = $avgFree
+    }
+    $orderedShopIds = $shopFreeAvg.GetEnumerator() | Sort-Object Value | ForEach-Object { $_.Key }
 
     # Totais globais
-    $globalTotalGB = [math]::Round(($shopStats | ForEach-Object { $_.TotalGB } | Measure-Object -Sum).Sum, 1)
-    $globalFreeGB  = [math]::Round(($shopStats | ForEach-Object { $_.FreeGB }  | Measure-Object -Sum).Sum, 1)
-    $globalUsedGB  = [math]::Round(($shopStats | ForEach-Object { $_.UsedGB }  | Measure-Object -Sum).Sum, 1)
+    $globalTotalGB = [math]::Round(($pcStats | ForEach-Object { $_.TotalGB } | Measure-Object -Sum).Sum, 1)
+    $globalFreeGB  = [math]::Round(($pcStats | ForEach-Object { $_.FreeGB }  | Measure-Object -Sum).Sum, 1)
+    $globalUsedGB  = [math]::Round(($pcStats | ForEach-Object { $_.UsedGB }  | Measure-Object -Sum).Sum, 1)
     $globalPctUsed = if ($globalTotalGB -gt 0) { [math]::Round($globalUsedGB / $globalTotalGB * 100, 1) } else { 0 }
 
     $css = @"
@@ -428,17 +434,17 @@ function toggleSection(id) {
     </div>
 
     <div class="shop-overview">
-        <h2>Resumo por Loja (ordenado por menos espaco livre)</h2>
+        <h2>Resumo por Computador (ordenado por menos espaco livre)</h2>
         <table>
-            <tr><th>#</th><th>Loja</th><th>PCs</th><th>Total (GB)</th><th>Usado (GB)</th><th>Livre (GB)</th><th>% Usado</th><th>Estado</th></tr>
+            <tr><th>#</th><th>Computador</th><th>Loja</th><th>Total (GB)</th><th>Usado (GB)</th><th>Livre (GB)</th><th>% Usado</th><th>Estado</th></tr>
 "@
 
     $rankIdx = 0
-    foreach ($stat in $shopStats) {
+    foreach ($stat in $pcStats) {
         $rankIdx++
         $rowClass = if ($stat.PctUsed -ge 85) { "disk-red" } elseif ($stat.PctUsed -ge 70) { "disk-yellow" } else { "disk-green" }
         $barClass = if ($stat.PctUsed -ge 85) { "bar-red" } elseif ($stat.PctUsed -ge 70) { "bar-yellow" } else { "bar-green" }
-        $html += "            <tr class=`"$rowClass`"><td>$rankIdx</td><td><strong>$($stat.ShopId)</strong></td><td>$($stat.PCs)</td><td>$($stat.TotalGB)</td><td>$($stat.UsedGB)</td><td>$($stat.FreeGB)</td><td>$($stat.PctUsed)%</td><td><div class=`"bar-container`"><div class=`"bar-fill $barClass`" style=`"width:$($stat.PctUsed)%`"></div></div></td></tr>`n"
+        $html += "            <tr class=`"$rowClass`"><td>$rankIdx</td><td><strong>$($stat.ComputerName)</strong></td><td>$($stat.ShopId)</td><td>$($stat.TotalGB)</td><td>$($stat.UsedGB)</td><td>$($stat.FreeGB)</td><td>$($stat.PctUsed)%</td><td><div class=`"bar-container`"><div class=`"bar-fill $barClass`" style=`"width:$($stat.PctUsed)%`"></div></div></td></tr>`n"
     }
     $html += @"
         </table>
